@@ -24,12 +24,15 @@ RUN python3 -m pip install --upgrade pip
 COPY requirements.txt .
 RUN pip3 install -r requirements.txt
 
+# Install websocat for websocket connections
+RUN wget -qO /usr/local/bin/websocat https://github.com/vi/websocat/releases/latest/download/websocat.x86_64-unknown-linux-musl    
+RUN chmod a+x /usr/local/bin/websocat
+
 # Install AWS CLI
 RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
     && unzip awscliv2.zip \
     && ./aws/install \
-    && rm awscliv2.zip \
-    && rm -rf aws
+    && rm -rf aws awscliv2.zip
 
 # Copy your scripts
 COPY ingest.py /home/ingest.py

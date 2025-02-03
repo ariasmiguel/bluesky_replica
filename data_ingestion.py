@@ -1,152 +1,84 @@
 import os
-import json
-import gzip
-import websockets
-import asyncio
-import boto3
-import clickhouse_connect
-from datetime import datetime
-from pathlib import Path
 import logging
+import time
+from datetime import datetime
+import clickhouse_driver
+from atproto import Client
+from typing import List, Dict, Any
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(
+    level=os.getenv('LOG_LEVEL', 'INFO'),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-class BlueskyIngestor:
+class BlueskyIngestion:
     def __init__(self):
-        self.ws_url = "wss://jetstream1.us-east.bsky.network"
-        self.bucket_path = os.environ['BUCKET_PATH']
-        self.max_messages = int(os.environ.get('MAX_MESSAGES', 1000))
-        self.s3_client = boto3.client('s3')
-        self.bucket_name = self.bucket_path.split('/')[2]
-        self.bucket_prefix = '/'.join(self.bucket_path.split('/')[3:])
-
-    def get_most_recent_file(self):
-        """Get the most recent CSV file from S3 bucket"""
+        self.client = clickhouse_driver.Client(
+            host=os.getenv('CLICKHOUSE_HOST', 'localhost'),
+            port=int(os.getenv('CLICKHOUSE_PORT', 9000)),
+            user=os.getenv('CLICKHOUSE_USER', 'default'),
+            password=os.getenv('CLICKHOUSE_PASSWORD', ''),
+            database=os.getenv('CLICKHOUSE_DATABASE', 'bluesky')
+        )
+        
+        self.bsky = Client()
+        self.batch_size = int(os.getenv('BATCH_SIZE', 1000))
+        
+    def connect_bluesky(self):
+        """Authenticate with Bluesky"""
+        self.bsky.login(
+            os.getenv('BLUESKY_USERNAME'),
+            os.getenv('BLUESKY_PASSWORD')
+        )
+    
+    def process_posts(self, posts: List[Dict[Any, Any]]):
+        """Process and insert posts into ClickHouse"""
         try:
-            response = self.s3_client.list_objects_v2(
-                Bucket=self.bucket_name,
-                Prefix=self.bucket_prefix
+            # Transform posts into the correct format
+            values = [
+                (
+                    post['uri'],
+                    post['author']['handle'],
+                    post['record']['text'],
+                    datetime.fromisoformat(post['record']['createdAt'].replace('Z', '+00:00')),
+                    post.get('likeCount', 0),
+                    post.get('repostCount', 0)
+                )
+                for post in posts
+            ]
+            
+            # Insert into ClickHouse
+            self.client.execute(
+                '''
+                INSERT INTO posts 
+                (uri, author_handle, content, created_at, like_count, repost_count)
+                VALUES
+                ''',
+                values
             )
             
-            if 'Contents' not in response:
-                logger.error("No files found in bucket")
-                return None
-
-            files = [obj['Key'] for obj in response['Contents'] 
-                    if obj['Key'].endswith('.csv.gz')]
-            
-            if not files:
-                logger.error("No matching .csv.gz files found")
-                return None
-
-            return sorted(files)[-1]
         except Exception as e:
-            logger.error(f"Error accessing S3: {e}")
-            return None
+            logger.error(f"Error processing posts: {e}")
+            raise
 
-    def extract_cursor(self, filename):
-        """Extract timestamp from filename"""
-        return Path(filename).stem.split('.')[0]
-
-    async def process_messages(self, cursor):
-        """Connect to WebSocket and process messages"""
-        output_file = "output.json"
-        messages = []
+def main():
+    ingestion = BlueskyIngestion()
+    
+    try:
+        ingestion.connect_bluesky()
+        logger.info("Connected to Bluesky successfully")
         
-        async with websockets.connect(
-            f"{self.ws_url}/subscribe?wantedCollections=app.*&cursor={cursor}"
-        ) as websocket:
-            while len(messages) < self.max_messages:
-                try:
-                    message = await websocket.recv()
-                    messages.append(json.loads(message))
-                except websockets.exceptions.ConnectionClosed:
-                    break
-
-        if messages:
-            with open(output_file, 'w') as f:
-                for msg in messages:
-                    f.write(json.dumps(msg) + '\n')
-
-        return len(messages), output_file
-
-    def process_chunk(self, count, output_file):
-        """Process message chunk and upload to S3"""
-        try:
-            # Get last timestamp
-            with open(output_file, 'r') as f:
-                lines = f.readlines()
-                last_message = json.loads(lines[-1])
-                last_value = str(last_message.get('time_us'))
-
-            if not last_value:
-                logger.error("Error: last_value is empty")
-                return False, None
-
-            # Rename files
-            json_file = f"{last_value}.json"
-            csv_file = f"{last_value}.csv"
-            gz_file = f"{csv_file}.gz"
+        # Main ingestion loop
+        while True:
+            # Implement your ingestion logic here
+            # This is a placeholder for the actual implementation
+            time.sleep(60)
             
-            os.rename(output_file, json_file)
-
-            # Process with ClickHouse
-            client = clickhouse_connect.get_client()
-            result = client.query(
-                "SELECT line as data FROM file($json_file, 'LineAsString')",
-                parameters={'json_file': json_file}
-            )
-
-            # Save to CSV and compress
-            with open(csv_file, 'w') as f:
-                f.write('data\n')  # header
-                for row in result.result_rows:
-                    f.write(f"{row[0]}\n")
-
-            with open(csv_file, 'rb') as f_in:
-                with gzip.open(gz_file, 'wb') as f_out:
-                    f_out.writelines(f_in)
-
-            # Upload to S3
-            s3_path = f"{self.bucket_prefix}/{gz_file}"
-            self.s3_client.upload_file(gz_file, self.bucket_name, s3_path)
-
-            # Cleanup
-            for file in [json_file, csv_file, gz_file]:
-                if os.path.exists(file):
-                    os.remove(file)
-
-            logger.info(f"Processed {count} messages")
-            return True, last_value
-
-        except Exception as e:
-            logger.error(f"Error processing chunk: {e}")
-            return False, None
-
-    async def run(self):
-        """Main ingestion loop"""
-        has_more = True
-        
-        while has_more:
-            most_recent_file = self.get_most_recent_file()
-            if not most_recent_file:
-                return
-
-            cursor = self.extract_cursor(most_recent_file)
-            logger.info(f"Extracted cursor: {cursor}")
-
-            count, output_file = await self.process_messages(cursor)
-            logger.info(f"Received {count} messages")
-
-            has_more = count >= self.max_messages
-            if has_more:
-                success, _ = self.process_chunk(count, output_file)
-                has_more = success
-
-async def main():
-    ingestor = BlueskyIngestor()
-    await ingestor.run()
+    except Exception as e:
+        logger.error(f"Fatal error in main loop: {e}")
+        raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

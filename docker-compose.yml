@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse_ddl:/docker-entrypoint-initdb.d
+    environment:
+      - CLICKHOUSE_DB=bluesky
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+
+  ingestion:
+    build: .
+    depends_on:
+      - clickhouse
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+
+volumes:
+  clickhouse_data: 
